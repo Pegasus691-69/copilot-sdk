@@ -1,6 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { describe, expect, it, onTestFinished } from "vitest";
-import { CopilotClient } from "../src/index.js";
+import { CopilotClient, parseCliUrl } from "../src/index.js";
+import { TcpTransport } from "../src/tcp-transport.js";
 
 // This file is for unit tests. Where relevant, prefer to add e2e tests in e2e/*.test.ts instead
 
@@ -29,84 +30,43 @@ describe("CopilotClient", () => {
 
     describe("URL parsing", () => {
         it("should parse port-only URL format", () => {
-            const client = new CopilotClient({
-                cliUrl: "8080",
-                logLevel: "error",
-            });
-
-            // Verify internal state
-            expect((client as any).actualPort).toBe(8080);
-            expect((client as any).actualHost).toBe("localhost");
-            expect((client as any).isExternalServer).toBe(true);
+            const result = parseCliUrl("8080");
+            expect(result.port).toBe(8080);
+            expect(result.host).toBe("localhost");
         });
 
         it("should parse host:port URL format", () => {
-            const client = new CopilotClient({
-                cliUrl: "127.0.0.1:9000",
-                logLevel: "error",
-            });
-
-            expect((client as any).actualPort).toBe(9000);
-            expect((client as any).actualHost).toBe("127.0.0.1");
-            expect((client as any).isExternalServer).toBe(true);
+            const result = parseCliUrl("127.0.0.1:9000");
+            expect(result.port).toBe(9000);
+            expect(result.host).toBe("127.0.0.1");
         });
 
         it("should parse http://host:port URL format", () => {
-            const client = new CopilotClient({
-                cliUrl: "http://localhost:7000",
-                logLevel: "error",
-            });
-
-            expect((client as any).actualPort).toBe(7000);
-            expect((client as any).actualHost).toBe("localhost");
-            expect((client as any).isExternalServer).toBe(true);
+            const result = parseCliUrl("http://localhost:7000");
+            expect(result.port).toBe(7000);
+            expect(result.host).toBe("localhost");
         });
 
         it("should parse https://host:port URL format", () => {
-            const client = new CopilotClient({
-                cliUrl: "https://example.com:443",
-                logLevel: "error",
-            });
-
-            expect((client as any).actualPort).toBe(443);
-            expect((client as any).actualHost).toBe("example.com");
-            expect((client as any).isExternalServer).toBe(true);
+            const result = parseCliUrl("https://example.com:443");
+            expect(result.port).toBe(443);
+            expect(result.host).toBe("example.com");
         });
 
         it("should throw error for invalid URL format", () => {
-            expect(() => {
-                new CopilotClient({
-                    cliUrl: "invalid-url",
-                    logLevel: "error",
-                });
-            }).toThrow(/Invalid cliUrl format/);
+            expect(() => parseCliUrl("invalid-url")).toThrow(/Invalid cliUrl format/);
         });
 
         it("should throw error for invalid port - too high", () => {
-            expect(() => {
-                new CopilotClient({
-                    cliUrl: "localhost:99999",
-                    logLevel: "error",
-                });
-            }).toThrow(/Invalid port in cliUrl/);
+            expect(() => parseCliUrl("localhost:99999")).toThrow(/Invalid port in cliUrl/);
         });
 
         it("should throw error for invalid port - zero", () => {
-            expect(() => {
-                new CopilotClient({
-                    cliUrl: "localhost:0",
-                    logLevel: "error",
-                });
-            }).toThrow(/Invalid port in cliUrl/);
+            expect(() => parseCliUrl("localhost:0")).toThrow(/Invalid port in cliUrl/);
         });
 
         it("should throw error for invalid port - negative", () => {
-            expect(() => {
-                new CopilotClient({
-                    cliUrl: "localhost:-1",
-                    logLevel: "error",
-                });
-            }).toThrow(/Invalid port in cliUrl/);
+            expect(() => parseCliUrl("localhost:-1")).toThrow(/Invalid port in cliUrl/);
         });
 
         it("should throw error when cliUrl is used with useStdio", () => {
@@ -138,13 +98,13 @@ describe("CopilotClient", () => {
             expect(client["options"].useStdio).toBe(false);
         });
 
-        it("should mark client as using external server", () => {
+        it("should create TcpTransport when cliUrl is provided", () => {
             const client = new CopilotClient({
                 cliUrl: "localhost:8080",
                 logLevel: "error",
             });
 
-            expect((client as any).isExternalServer).toBe(true);
+            expect((client as any).transport).toBeInstanceOf(TcpTransport);
         });
     });
 
@@ -158,12 +118,12 @@ describe("CopilotClient", () => {
             expect((client as any).options.githubToken).toBe("gho_test_token");
         });
 
-        it("should default useLoggedInUser to true when no githubToken", () => {
+        it("should default useLoggedInUser to false (secure by default)", () => {
             const client = new CopilotClient({
                 logLevel: "error",
             });
 
-            expect((client as any).options.useLoggedInUser).toBe(true);
+            expect((client as any).options.useLoggedInUser).toBe(false);
         });
 
         it("should default useLoggedInUser to false when githubToken is provided", () => {

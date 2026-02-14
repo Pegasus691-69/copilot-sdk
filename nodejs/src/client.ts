@@ -11,19 +11,13 @@
  * @module client
  */
 
-import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
-import { Socket } from "node:net";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-import {
-    createMessageConnection,
-    MessageConnection,
-    StreamMessageReader,
-    StreamMessageWriter,
-} from "vscode-jsonrpc/node.js";
+import type { MessageConnection } from "vscode-jsonrpc/node.js";
 import { getSdkProtocolVersion } from "./sdkProtocolVersion.js";
 import { CopilotSession } from "./session.js";
+import type { Transport } from "./transport.js";
+import { StdioTransport, getBundledCliPath } from "./stdio-transport.js";
+import { TcpTransport, parseCliUrl } from "./tcp-transport.js";
+import { WasmTransport } from "./wasm-transport.js";
 import type {
     ConnectionState,
     CopilotClientOptions,
@@ -104,36 +98,22 @@ function toJsonSchema(parameters: Tool["parameters"]): Record<string, unknown> |
  * ```
  */
 
-/**
- * Gets the path to the bundled CLI from the @github/copilot package.
- * Uses index.js directly rather than npm-loader.js (which spawns the native binary).
- */
-function getBundledCliPath(): string {
-    // Find the actual location of the @github/copilot package by resolving its sdk export
-    const sdkUrl = import.meta.resolve("@github/copilot/sdk");
-    const sdkPath = fileURLToPath(sdkUrl);
-    // sdkPath is like .../node_modules/@github/copilot/sdk/index.js
-    // Go up two levels to get the package root, then append index.js
-    return join(dirname(dirname(sdkPath)), "index.js");
-}
-
 export class CopilotClient {
-    private cliProcess: ChildProcess | null = null;
+    private transport: Transport | null = null;
     private connection: MessageConnection | null = null;
-    private socket: Socket | null = null;
-    private actualPort: number | null = null;
-    private actualHost: string = "localhost";
     private state: ConnectionState = "disconnected";
     private sessions: Map<string, CopilotSession> = new Map();
     private options: Required<
-        Omit<CopilotClientOptions, "cliUrl" | "githubToken" | "useLoggedInUser">
+        Omit<CopilotClientOptions, "cliUrl" | "githubToken" | "useLoggedInUser" | "runtime" | "wasmModule" | "apiUrl" | "httpPost">
     > & {
         cliUrl?: string;
         githubToken?: string;
         useLoggedInUser?: boolean;
+        runtime?: "native" | "wasm";
+        wasmModule?: CopilotClientOptions["wasmModule"];
+        apiUrl?: string;
+        httpPost?: CopilotClientOptions["httpPost"];
     };
-    private isExternalServer: boolean = false;
-    private forceStopping: boolean = false;
     private modelsCache: ModelInfo[] | null = null;
     private modelsCacheLock: Promise<void> = Promise.resolve();
     private sessionLifecycleHandlers: Set<SessionLifecycleHandler> = new Set();
@@ -164,6 +144,20 @@ export class CopilotClient {
      * ```
      */
     constructor(options: CopilotClientOptions = {}) {
+        // Validate runtime option
+        if (
+            options.runtime === "wasm" &&
+            (options.cliPath || options.cliUrl || options.useStdio === true)
+        ) {
+            throw new Error(
+                "runtime 'wasm' is mutually exclusive with cliPath, cliUrl, and useStdio"
+            );
+        }
+
+        if (options.runtime === "wasm" && !options.wasmModule) {
+            throw new Error("wasmModule is required when runtime is 'wasm'");
+        }
+
         // Validate mutually exclusive options
         if (options.cliUrl && (options.useStdio === true || options.cliPath)) {
             throw new Error("cliUrl is mutually exclusive with useStdio and cliPath");
@@ -176,60 +170,73 @@ export class CopilotClient {
             );
         }
 
-        // Parse cliUrl if provided
-        if (options.cliUrl) {
-            const { host, port } = this.parseCliUrl(options.cliUrl);
-            this.actualHost = host;
-            this.actualPort = port;
-            this.isExternalServer = true;
-        }
-
         this.options = {
             cliPath: options.cliPath || getBundledCliPath(),
             cliArgs: options.cliArgs ?? [],
             cwd: options.cwd ?? process.cwd(),
             port: options.port || 0,
-            useStdio: options.cliUrl ? false : (options.useStdio ?? true), // Default to stdio unless cliUrl is provided
+            useStdio: options.cliUrl ? false : (options.useStdio ?? true),
             cliUrl: options.cliUrl,
             logLevel: options.logLevel || "debug",
             autoStart: options.autoStart ?? true,
             autoRestart: options.autoRestart ?? true,
             env: options.env ?? process.env,
             githubToken: options.githubToken,
-            // Default useLoggedInUser to false when githubToken is provided, otherwise true
-            useLoggedInUser: options.useLoggedInUser ?? (options.githubToken ? false : true),
+            // Default useLoggedInUser to false (secure by default)
+            useLoggedInUser: options.useLoggedInUser ?? false,
+            runtime: options.runtime,
+            wasmModule: options.wasmModule,
+            apiUrl: options.apiUrl,
+            httpPost: options.httpPost,
         };
-    }
 
-    /**
-     * Parse CLI URL into host and port
-     * Supports formats: "host:port", "http://host:port", "https://host:port", or just "port"
-     */
-    private parseCliUrl(url: string): { host: string; port: number } {
-        // Remove protocol if present
-        let cleanUrl = url.replace(/^https?:\/\//, "");
-
-        // Check if it's just a port number
-        if (/^\d+$/.test(cleanUrl)) {
-            return { host: "localhost", port: parseInt(cleanUrl, 10) };
+        // Create the appropriate transport
+        if (options.runtime === "wasm") {
+            this.transport = new WasmTransport({
+                wasmModule: options.wasmModule,
+                authToken: options.githubToken,
+                apiUrl: options.apiUrl,
+                httpPost: options.httpPost,
+            });
+        } else if (options.cliUrl) {
+            const { host, port } = parseCliUrl(options.cliUrl);
+            this.transport = new TcpTransport({
+                host,
+                port,
+                isExternalServer: true,
+            });
+        } else if (this.options.useStdio) {
+            this.transport = new StdioTransport({
+                cliPath: this.options.cliPath,
+                cliArgs: this.options.cliArgs,
+                cwd: this.options.cwd,
+                logLevel: this.options.logLevel,
+                env: this.options.env,
+                githubToken: this.options.githubToken,
+                useLoggedInUser: this.options.useLoggedInUser,
+                onExit: () => {
+                    if (this.options.autoRestart && this.state === "connected") {
+                        void this.reconnect();
+                    }
+                },
+            });
+        } else {
+            this.transport = new TcpTransport({
+                cliPath: this.options.cliPath,
+                cliArgs: this.options.cliArgs,
+                cwd: this.options.cwd,
+                logLevel: this.options.logLevel,
+                env: this.options.env,
+                githubToken: this.options.githubToken,
+                useLoggedInUser: this.options.useLoggedInUser,
+                port: this.options.port,
+                onExit: () => {
+                    if (this.options.autoRestart && this.state === "connected") {
+                        void this.reconnect();
+                    }
+                },
+            });
         }
-
-        // Parse host:port format
-        const parts = cleanUrl.split(":");
-        if (parts.length !== 2) {
-            throw new Error(
-                `Invalid cliUrl format: ${url}. Expected "host:port", "http://host:port", or "port"`
-            );
-        }
-
-        const host = parts[0] || "localhost";
-        const port = parseInt(parts[1], 10);
-
-        if (isNaN(port) || port <= 0 || port > 65535) {
-            throw new Error(`Invalid port in cliUrl: ${url}`);
-        }
-
-        return { host, port };
     }
 
     /**
@@ -258,13 +265,11 @@ export class CopilotClient {
         this.state = "connecting";
 
         try {
-            // Only start CLI server process if not connecting to external server
-            if (!this.isExternalServer) {
-                await this.startCLIServer();
-            }
+            await this.transport!.start();
+            this.connection = this.transport!.connection;
 
-            // Connect to the server
-            await this.connectToServer();
+            // Attach session routing handlers
+            this.attachConnectionHandlers();
 
             // Verify protocol version compatibility
             await this.verifyProtocolVersion();
@@ -330,52 +335,17 @@ export class CopilotClient {
         }
         this.sessions.clear();
 
-        // Close connection
-        if (this.connection) {
-            try {
-                this.connection.dispose();
-            } catch (error) {
-                errors.push(
-                    new Error(
-                        `Failed to dispose connection: ${error instanceof Error ? error.message : String(error)}`
-                    )
-                );
-            }
-            this.connection = null;
-        }
-
         // Clear models cache
         this.modelsCache = null;
 
-        if (this.socket) {
-            try {
-                this.socket.end();
-            } catch (error) {
-                errors.push(
-                    new Error(
-                        `Failed to close socket: ${error instanceof Error ? error.message : String(error)}`
-                    )
-                );
-            }
-            this.socket = null;
+        // Stop transport (handles connection, socket, process cleanup)
+        if (this.transport) {
+            const transportErrors = await this.transport.stop();
+            errors.push(...transportErrors);
         }
-
-        // Kill CLI process (only if we spawned it)
-        if (this.cliProcess && !this.isExternalServer) {
-            try {
-                this.cliProcess.kill();
-            } catch (error) {
-                errors.push(
-                    new Error(
-                        `Failed to kill CLI process: ${error instanceof Error ? error.message : String(error)}`
-                    )
-                );
-            }
-            this.cliProcess = null;
-        }
+        this.connection = null;
 
         this.state = "disconnected";
-        this.actualPort = null;
 
         return errors;
     }
@@ -406,45 +376,19 @@ export class CopilotClient {
      * ```
      */
     async forceStop(): Promise<void> {
-        this.forceStopping = true;
-
         // Clear sessions immediately without trying to destroy them
         this.sessions.clear();
-
-        // Force close connection
-        if (this.connection) {
-            try {
-                this.connection.dispose();
-            } catch {
-                // Ignore errors during force stop
-            }
-            this.connection = null;
-        }
 
         // Clear models cache
         this.modelsCache = null;
 
-        if (this.socket) {
-            try {
-                this.socket.destroy(); // destroy() is more forceful than end()
-            } catch {
-                // Ignore errors
-            }
-            this.socket = null;
+        // Force stop transport (handles connection, socket, process cleanup)
+        if (this.transport) {
+            await this.transport.forceStop();
         }
-
-        // Force kill CLI process (only if we spawned it)
-        if (this.cliProcess && !this.isExternalServer) {
-            try {
-                this.cliProcess.kill("SIGKILL");
-            } catch {
-                // Ignore errors
-            }
-            this.cliProcess = null;
-        }
+        this.connection = null;
 
         this.state = "disconnected";
-        this.actualPort = null;
     }
 
     /**
@@ -508,6 +452,9 @@ export class CopilotClient {
             skillDirectories: config.skillDirectories,
             disabledSkills: config.disabledSkills,
             infiniteSessions: config.infiniteSessions,
+            configDiscovery: config.configDiscovery,
+            agentDiscovery: config.agentDiscovery,
+            sessionStorage: config.sessionStorage,
         });
 
         const { sessionId, workspacePath } = response as {
@@ -590,6 +537,9 @@ export class CopilotClient {
             disabledSkills: config.disabledSkills,
             infiniteSessions: config.infiniteSessions,
             disableResume: config.disableResume,
+            configDiscovery: config.configDiscovery,
+            agentDiscovery: config.agentDiscovery,
+            sessionStorage: config.sessionStorage,
         });
 
         const { sessionId: resumedSessionId, workspacePath } = response as {
@@ -976,192 +926,6 @@ export class CopilotClient {
         return () => {
             this.sessionLifecycleHandlers.delete(wildcardHandler);
         };
-    }
-
-    /**
-     * Start the CLI server process
-     */
-    private async startCLIServer(): Promise<void> {
-        return new Promise((resolve, reject) => {
-            const args = [
-                ...this.options.cliArgs,
-                "--headless",
-                "--no-auto-update",
-                "--log-level",
-                this.options.logLevel,
-            ];
-
-            // Choose transport mode
-            if (this.options.useStdio) {
-                args.push("--stdio");
-            } else if (this.options.port > 0) {
-                args.push("--port", this.options.port.toString());
-            }
-
-            // Add auth-related flags
-            if (this.options.githubToken) {
-                args.push("--auth-token-env", "COPILOT_SDK_AUTH_TOKEN");
-            }
-            if (!this.options.useLoggedInUser) {
-                args.push("--no-auto-login");
-            }
-
-            // Suppress debug/trace output that might pollute stdout
-            const envWithoutNodeDebug = { ...this.options.env };
-            delete envWithoutNodeDebug.NODE_DEBUG;
-
-            // Set auth token in environment if provided
-            if (this.options.githubToken) {
-                envWithoutNodeDebug.COPILOT_SDK_AUTH_TOKEN = this.options.githubToken;
-            }
-
-            // Verify CLI exists before attempting to spawn
-            if (!existsSync(this.options.cliPath)) {
-                throw new Error(
-                    `Copilot CLI not found at ${this.options.cliPath}. Ensure @github/copilot is installed.`
-                );
-            }
-
-            const stdioConfig: ["pipe", "pipe", "pipe"] | ["ignore", "pipe", "pipe"] = this.options
-                .useStdio
-                ? ["pipe", "pipe", "pipe"]
-                : ["ignore", "pipe", "pipe"];
-
-            // For .js files, spawn node explicitly; for executables, spawn directly
-            const isJsFile = this.options.cliPath.endsWith(".js");
-            if (isJsFile) {
-                this.cliProcess = spawn(process.execPath, [this.options.cliPath, ...args], {
-                    stdio: stdioConfig,
-                    cwd: this.options.cwd,
-                    env: envWithoutNodeDebug,
-                });
-            } else {
-                this.cliProcess = spawn(this.options.cliPath, args, {
-                    stdio: stdioConfig,
-                    cwd: this.options.cwd,
-                    env: envWithoutNodeDebug,
-                });
-            }
-
-            let stdout = "";
-            let resolved = false;
-
-            // For stdio mode, we're ready immediately after spawn
-            if (this.options.useStdio) {
-                resolved = true;
-                resolve();
-            } else {
-                // For TCP mode, wait for port announcement
-                this.cliProcess.stdout?.on("data", (data: Buffer) => {
-                    stdout += data.toString();
-                    const match = stdout.match(/listening on port (\d+)/i);
-                    if (match && !resolved) {
-                        this.actualPort = parseInt(match[1], 10);
-                        resolved = true;
-                        resolve();
-                    }
-                });
-            }
-
-            this.cliProcess.stderr?.on("data", (data: Buffer) => {
-                // Forward CLI stderr to parent's stderr so debug logs are visible
-                const lines = data.toString().split("\n");
-                for (const line of lines) {
-                    if (line.trim()) {
-                        process.stderr.write(`[CLI subprocess] ${line}\n`);
-                    }
-                }
-            });
-
-            this.cliProcess.on("error", (error) => {
-                if (!resolved) {
-                    resolved = true;
-                    reject(new Error(`Failed to start CLI server: ${error.message}`));
-                }
-            });
-
-            this.cliProcess.on("exit", (code) => {
-                if (!resolved) {
-                    resolved = true;
-                    reject(new Error(`CLI server exited with code ${code}`));
-                } else if (this.options.autoRestart && this.state === "connected") {
-                    void this.reconnect();
-                }
-            });
-
-            // Timeout after 10 seconds
-            setTimeout(() => {
-                if (!resolved) {
-                    resolved = true;
-                    reject(new Error("Timeout waiting for CLI server to start"));
-                }
-            }, 10000);
-        });
-    }
-
-    /**
-     * Connect to the CLI server (via socket or stdio)
-     */
-    private async connectToServer(): Promise<void> {
-        if (this.options.useStdio) {
-            return this.connectViaStdio();
-        } else {
-            return this.connectViaTcp();
-        }
-    }
-
-    /**
-     * Connect via stdio pipes
-     */
-    private async connectViaStdio(): Promise<void> {
-        if (!this.cliProcess) {
-            throw new Error("CLI process not started");
-        }
-
-        // Add error handler to stdin to prevent unhandled rejections during forceStop
-        this.cliProcess.stdin?.on("error", (err) => {
-            if (!this.forceStopping) {
-                throw err;
-            }
-        });
-
-        // Create JSON-RPC connection over stdin/stdout
-        this.connection = createMessageConnection(
-            new StreamMessageReader(this.cliProcess.stdout!),
-            new StreamMessageWriter(this.cliProcess.stdin!)
-        );
-
-        this.attachConnectionHandlers();
-        this.connection.listen();
-    }
-
-    /**
-     * Connect to the CLI server via TCP socket
-     */
-    private async connectViaTcp(): Promise<void> {
-        if (!this.actualPort) {
-            throw new Error("Server port not available");
-        }
-
-        return new Promise((resolve, reject) => {
-            this.socket = new Socket();
-
-            this.socket.connect(this.actualPort!, this.actualHost, () => {
-                // Create JSON-RPC connection
-                this.connection = createMessageConnection(
-                    new StreamMessageReader(this.socket!),
-                    new StreamMessageWriter(this.socket!)
-                );
-
-                this.attachConnectionHandlers();
-                this.connection.listen();
-                resolve();
-            });
-
-            this.socket.on("error", (error) => {
-                reject(new Error(`Failed to connect to CLI server: ${error.message}`));
-            });
-        });
     }
 
     private attachConnectionHandlers(): void {

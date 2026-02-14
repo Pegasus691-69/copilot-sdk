@@ -11,6 +11,23 @@
 export { CopilotClient } from "./client.js";
 export { CopilotSession, type AssistantMessageEvent } from "./session.js";
 export { defineTool } from "./types.js";
+export { type Transport } from "./transport.js";
+export { StdioTransport, type StdioTransportOptions } from "./stdio-transport.js";
+export { TcpTransport, parseCliUrl, type TcpTransportOptions } from "./tcp-transport.js";
+export {
+    WasmTransport,
+    WasmConnection,
+    type WasmModule,
+    type WasmTransportOptions,
+} from "./wasm-transport.js";
+export {
+    preset,
+    type PresetName,
+    type PresetConfig,
+    type PresetSessionConfig,
+    type PresetClientConfig,
+} from "./presets.js";
+export { InMemoryFileSystem, type FileSystemProvider } from "./filesystem.js";
 export type {
     ConnectionState,
     CopilotClientOptions,

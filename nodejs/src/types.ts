@@ -10,6 +10,9 @@
 import type { SessionEvent as GeneratedSessionEvent } from "./generated/session-events.js";
 export type SessionEvent = GeneratedSessionEvent;
 
+import type { FileSystemProvider } from "./filesystem.js";
+export type { FileSystemProvider } from "./filesystem.js";
+
 /**
  * Options for creating a CopilotClient
  */
@@ -86,9 +89,32 @@ export interface CopilotClientOptions {
      * Whether to use the logged-in user for authentication.
      * When true, the CLI server will attempt to use stored OAuth tokens or gh CLI auth.
      * When false, only explicit tokens (githubToken or environment variables) are used.
-     * @default true (but defaults to false when githubToken is provided)
+     * @default false
      */
     useLoggedInUser?: boolean;
+
+    /**
+     * Runtime mode. When set to "wasm", uses in-process WASM transport.
+     * Mutually exclusive with cliPath, cliUrl, useStdio.
+     */
+    runtime?: "native" | "wasm";
+
+    /**
+     * WASM module instance or loader function.
+     * Required when runtime is "wasm".
+     */
+    wasmModule?: import("./wasm-transport.js").WasmModule | (() => Promise<import("./wasm-transport.js").WasmModule>);
+
+    /**
+     * Copilot API URL override. Used with WASM runtime.
+     */
+    apiUrl?: string;
+
+    /**
+     * Custom HTTP POST implementation for the WASM runtime.
+     * Defaults to using fetch().
+     */
+    httpPost?: (url: string, headersJson: string, bodyJson: string) => Promise<{ status: number; body: string }>;
 }
 
 /**
@@ -723,6 +749,32 @@ export interface SessionConfig {
      * Set to `{ enabled: false }` to disable.
      */
     infiniteSessions?: InfiniteSessionConfig;
+
+    /**
+     * Whether to enable config file discovery (scanning .github/, ~/.copilot/, etc.)
+     * @default false
+     */
+    configDiscovery?: boolean;
+
+    /**
+     * Whether to enable agent auto-discovery from .github/agents/
+     * @default false
+     */
+    agentDiscovery?: boolean;
+
+    /**
+     * Session storage mode.
+     * - "memory": In-memory only (default, secure)
+     * - "disk": Persist to ~/.copilot/session-state/
+     * @default "memory"
+     */
+    sessionStorage?: "memory" | "disk";
+
+    /**
+     * FileSystem provider for tool operations.
+     * Required for filesystem-based tools (view, edit, etc.) in WASM mode.
+     */
+    filesystem?: FileSystemProvider;
 }
 
 /**
@@ -748,6 +800,10 @@ export type ResumeSessionConfig = Pick<
     | "skillDirectories"
     | "disabledSkills"
     | "infiniteSessions"
+    | "configDiscovery"
+    | "agentDiscovery"
+    | "sessionStorage"
+    | "filesystem"
 > & {
     /**
      * When true, skips emitting the session.resume event.
