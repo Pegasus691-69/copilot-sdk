@@ -85,6 +85,17 @@ playground:
     @echo "=== Starting SDK Playground ==="
     @cd demos/playground && npm install && npm start
 
+# Generate Go reference docs (Markdown + HTML)
+docs-go: docs-go-md docs-go-serve
+
+# Generate Go Markdown reference docs via gomarkdoc
+docs-go-md:
+    @./scripts/generate-go-docs.sh markdown
+
+# Start local Go HTML doc server (pkgsite) at http://localhost:6060
+docs-go-serve:
+    @./scripts/generate-go-docs.sh serve
+
 # Validate documentation code examples
 validate-docs: validate-docs-extract validate-docs-check
 
